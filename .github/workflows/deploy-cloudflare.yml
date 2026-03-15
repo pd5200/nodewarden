@@ -35,41 +35,41 @@
 #
 # =============================================================================
 
-name: Deploy to Cloudflare Workers
+name: Deploy
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
-
-concurrency:
-  group: deploy-cloudflare-${{ github.ref }}
-  cancel-in-progress: false
-
-permissions:
-  contents: read
+    branches: [main]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Setup Node.js
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          cache: npm
+          node-version: 20
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install Wrangler
+        run: npm install -g wrangler
 
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
-          # wrangler.toml 里已有 [build] command = "npm run build"，会顺带构建前端
+      - name: Login Cloudflare
+        run: |
+          wrangler whoami
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Set Secrets
+        run: |
+          echo "${{ secrets.JWT_SECRET }}" | wrangler secret put JWT_SECRET
+          echo "${{ secrets.TOTP_SECRET }}" | wrangler secret put TOTP_SECRET
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Deploy
+        run: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
