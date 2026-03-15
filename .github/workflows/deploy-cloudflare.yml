@@ -35,46 +35,40 @@
 #
 # =============================================================================
 
-name: Deploy
+name: Deploy to Cloudflare Workers
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloudflare-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "22"
+          cache: npm
 
-      - name: Install Wrangler
-        run: npm install -g wrangler
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Login Cloudflare
-        run: wrangler whoami
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      - name: Update Secrets
-        run: |
-          wrangler secret delete JWT_SECRET --name nodewarden || true
-          echo "${{ secrets.JWT_SECRET }}" | wrangler secret put JWT_SECRET --name nodewarden
-
-          wrangler secret delete TOTP_SECRET --name nodewarden || true
-          echo "${{ secrets.TOTP_SECRET }}" | wrangler secret put TOTP_SECRET --name nodewarden
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      - name: Deploy
-        run: wrangler deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
