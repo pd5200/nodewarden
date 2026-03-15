@@ -1,0 +1,91 @@
+# =============================================================================
+# Cloudflare Workers 自动部署
+# =============================================================================
+#
+# 【必须在 GitHub 里配置的 Secrets（仓库 Settings → Secrets and variables → Actions）】
+#
+# 1) CLOUDFLARE_API_TOKEN（必填）
+#    在 Cloudflare 控制台：右上角头像 → My Profile → API Tokens → Create Token
+#    推荐：使用模板「Edit Cloudflare Workers」，或自定义 Token，至少包含：
+#      • Account → Workers Scripts → Edit        （部署 Worker）
+#      • Account → Workers Tail → Read           （可选，仅 tail 日志）
+#      • Account → D1 → Edit                     （本项目使用 D1：nodewarden-db）
+#      • Account → R2 Storage → Edit             （本项目使用 R2：nodewarden-attachments）
+#      • Account → Workers KV Storage → Edit     （若你改用 wrangler.kv.toml 部署则需要）
+#      • Account → Account Settings → Read       （Wrangler 常需要读取账户信息）
+#    不要用 Global API Key，请用有限权限的 API Token。
+#
+# 2) CLOUDFLARE_ACCOUNT_ID（必填，除非已在 wrangler.toml 里写死 account_id）
+#    位置：Cloudflare 控制台 → 任意 Workers 页面右侧，或 Overview 里「Account ID」
+#    建议放在 Secrets；也可放在 Variables（非敏感，但 Secret 更统一）
+#
+# 【若使用 KV 版 Worker（wrangler.kv.toml）】
+#   把下方 job 里 wrangler-action 的 command 改为：deploy --config wrangler.kv.toml
+#   且 Token 需含 Workers KV Storage → Edit。
+#
+# 【GitHub Actions 权限（本 workflow 已写明）】
+#
+#   contents: read     — 检出代码
+#   （无需写仓库权限；部署只走 Cloudflare API）
+#
+# 【Cloudflare 侧前提】
+#
+#   • 账号下已存在 wrangler.toml 里同名的 D1（database_name）、R2（bucket_name）
+#   • Worker 名称与 wrangler.toml 的 name 一致，或首次部署会创建新 Worker
+#   • 敏感配置（如 JWT_SECRET）若在 Dashboard 里绑了，CI 部署会保留；勿把密钥写进仓库
+#
+# =============================================================================
+
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloudflare-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # 未配置 Secret 时跳过（fork 或未设 CI 的仓库不会红字失败）
+    if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+          # wrangler.toml 里已有 [build] command = "npm run build"，会顺带构建前端
+
+  # 未配 Secret 时单独提示，避免「什么都没发生」的困惑
+  secrets-hint:
+    runs-on: ubuntu-latest
+    if: ${{ secrets.CLOUDFLARE_API_TOKEN == '' || secrets.CLOUDFLARE_ACCOUNT_ID == '' }}
+    steps:
+      - name: 说明
+        run: |
+          echo "::notice::已跳过部署：请在仓库 Settings → Secrets and variables → Actions 中配置"
+          echo "  • CLOUDFLARE_API_TOKEN"
+          echo "  • CLOUDFLARE_ACCOUNT_ID"
+          echo "详细权限与步骤见 .github/workflows/deploy-cloudflare.yml 文件顶部注释。"
