@@ -31,26 +31,57 @@ function resolveTotpSecret(userSecret: string | null): string | null {
   return null;
 }
 
+function buildPreloginResponse(
+  email: string,
+  kdfType: number,
+  kdfIterations: number,
+  kdfMemory: number | null,
+  kdfParallelism: number | null
+): Record<string, unknown> {
+  return {
+    kdf: kdfType,
+    kdfIterations,
+    kdfMemory,
+    kdfParallelism,
+    KdfSettings: {
+      KdfType: kdfType,
+      Iterations: kdfIterations,
+      Memory: kdfMemory,
+      Parallelism: kdfParallelism,
+    },
+    Salt: email.toLowerCase(),
+  };
+}
+
 function twoFactorRequiredResponse(message: string = 'Two factor required.', includeRecoveryCode: boolean = false): Response {
   const providers = includeRecoveryCode
     ? [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR), TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE]
     : [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)];
   const providers2: Record<string, null> = {};
   for (const provider of providers) providers2[provider] = null;
+  const customResponse = {
+    TwoFactorProviders: providers,
+    TwoFactorProviders2: providers2,
+    SsoEmail2faSessionToken: null,
+    MasterPasswordPolicy: {
+      Object: 'masterPasswordPolicy',
+    },
+  };
 
   // Bitwarden clients rely on these fields to trigger the 2FA UI flow.
   return jsonResponse(
     {
       error: 'invalid_grant',
       error_description: message,
-      TwoFactorProviders: providers,
-      TwoFactorProviders2: providers2,
+      Error: 'invalid_grant',
+      ErrorDescription: message,
+      ErrorMessage: message,
+      TwoFactorProviders: customResponse.TwoFactorProviders,
+      TwoFactorProviders2: customResponse.TwoFactorProviders2,
       // Required by current Android parser (nullable value is acceptable).
-      SsoEmail2faSessionToken: null,
-      // Keep payload shape close to upstream implementations.
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      SsoEmail2faSessionToken: customResponse.SsoEmail2faSessionToken,
+      MasterPasswordPolicy: customResponse.MasterPasswordPolicy,
+      CustomResponse: customResponse,
       ErrorModel: {
         Message: message,
         Object: 'error',
@@ -417,12 +448,7 @@ export async function handlePrelogin(request: Request, env: Env): Promise<Respon
   const kdfMemory = user?.kdfMemory ?? null;
   const kdfParallelism = user?.kdfParallelism ?? null;
 
-  return jsonResponse({
-    kdf: kdfType,
-    kdfIterations: kdfIterations,
-    kdfMemory: kdfMemory,
-    kdfParallelism: kdfParallelism,
-  });
+  return jsonResponse(buildPreloginResponse(email, kdfType, kdfIterations, kdfMemory, kdfParallelism));
 }
 
 // POST /identity/connect/revocation
