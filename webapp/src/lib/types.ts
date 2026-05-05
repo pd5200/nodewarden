@@ -25,6 +25,8 @@ export interface Folder {
   id: string;
   name: string;
   decName?: string;
+  revisionDate?: string;
+  creationDate?: string;
 }
 
 export interface CipherLoginUri {
@@ -148,6 +150,12 @@ export interface CipherField {
   decValue?: string;
 }
 
+export interface CipherPasswordHistoryEntry {
+  password?: string | null;
+  lastUsedDate?: string | null;
+  decPassword?: string;
+}
+
 export interface Cipher {
   id: string;
   type: number;
@@ -167,7 +175,7 @@ export interface Cipher {
   identity?: CipherIdentity | null;
   sshKey?: CipherSshKey | null;
   secureNote?: { type?: number | null } | null;
-  passwordHistory?: Array<{ password?: string | null; lastUsedDate?: string | null }> | null;
+  passwordHistory?: CipherPasswordHistoryEntry[] | null;
   fields?: CipherField[] | null;
   decName?: string;
   decNotes?: string;
@@ -338,10 +346,14 @@ export interface AdminInvite {
 export interface AuthorizedDevice {
   id: string;
   name: string;
+  systemName?: string | null;
+  deviceNote?: string | null;
   identifier: string;
   type: number;
   creationDate: string | null;
   revisionDate: string | null;
+  lastSeenAt?: string | null;
+  hasStoredDevice?: boolean;
   online: boolean;
   trusted: boolean;
   trustedTokenCount: number;
