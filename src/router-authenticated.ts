@@ -3,6 +3,7 @@ import { errorResponse, jsonResponse } from './utils/response';
 import {
   handleGetProfile,
   handleUpdateProfile,
+  handleGetKeys,
   handleSetKeys,
   handleGetRevisionDate,
   handleVerifyPassword,
@@ -14,6 +15,10 @@ import {
   handleGetTwoFactorProviders,
   handleGetTwoFactorAuthenticator,
   handlePutTwoFactorAuthenticator,
+  handleGetTwoFactorYubiKey,
+  handlePutTwoFactorYubiKey,
+  handlePutTwoFactorYubiKeyConfig,
+  handleBootstrapTwoFactorYubiKeyConfig,
   handleDisableTwoFactorProvider,
   handleGetApiKey,
   handleRotateApiKey,
@@ -73,9 +78,13 @@ import { handleGetDomains, handleUpdateDomains } from './handlers/domains';
 import {
   handleCreateAccountPasskeyCredential,
   handleDeleteAccountPasskeyCredential,
+  handleDeleteTwoFactorWebAuthn,
   handleGetAccountPasskeyAttestationOptions,
   handleGetAccountPasskeyCredentials,
   handleGetAccountPasskeyUpdateAssertionOptions,
+  handleGetTwoFactorWebAuthn,
+  handleGetTwoFactorWebAuthnChallenge,
+  handlePutTwoFactorWebAuthn,
   handleUpdateAccountPasskeyEncryption,
 } from './handlers/account-passkeys';
 import {
@@ -115,8 +124,10 @@ export async function handleAuthenticatedRoute(
     return handleChangePassword(request, env, userId);
   }
 
-  if (path === '/api/accounts/keys' && method === 'POST') {
-    return handleSetKeys(request, env, userId);
+  if (path === '/api/accounts/keys') {
+    if (method === 'GET') return handleGetKeys(request, env, userId);
+    if (method === 'POST') return handleSetKeys(request, env, userId);
+    return errorResponse('Method not allowed', 405);
   }
 
   if (path === '/api/accounts/totp') {
@@ -138,10 +149,42 @@ export async function handleAuthenticatedRoute(
     return handleGetTwoFactorAuthenticator(request, env, userId);
   }
 
+  if ((path === '/api/two-factor/get-yubikey' || path === '/api/two-factor/get-yubi-key') && method === 'POST') {
+    return handleGetTwoFactorYubiKey(request, env, userId);
+  }
+
+  if (path === '/api/two-factor/get-webauthn' && method === 'POST') {
+    return handleGetTwoFactorWebAuthn(request, env, userId, currentUser);
+  }
+
+  if (path === '/api/two-factor/get-webauthn-challenge' && method === 'POST') {
+    return handleGetTwoFactorWebAuthnChallenge(request, env, userId, currentUser);
+  }
+
   if (path === '/api/two-factor/authenticator') {
     if (method === 'PUT' || method === 'POST') return handlePutTwoFactorAuthenticator(request, env, userId);
     if (method === 'DELETE') return handleDisableTwoFactorProvider(request, env, userId);
     return errorResponse('Method not allowed', 405);
+  }
+
+  if ((path === '/api/two-factor/yubikey' || path === '/api/two-factor/yubi-key')) {
+    if (method === 'PUT' || method === 'POST') return handlePutTwoFactorYubiKey(request, env, userId);
+    if (method === 'DELETE') return handleDisableTwoFactorProvider(request, env, userId);
+    return errorResponse('Method not allowed', 405);
+  }
+
+  if (path === '/api/two-factor/webauthn') {
+    if (method === 'PUT' || method === 'POST') return handlePutTwoFactorWebAuthn(request, env, userId, currentUser);
+    if (method === 'DELETE') return handleDeleteTwoFactorWebAuthn(request, env, userId, currentUser);
+    return errorResponse('Method not allowed', 405);
+  }
+
+  if ((path === '/api/two-factor/yubikey/config' || path === '/api/two-factor/yubi-key/config') && (method === 'PUT' || method === 'POST')) {
+    return handlePutTwoFactorYubiKeyConfig(request, env, userId);
+  }
+
+  if ((path === '/api/two-factor/yubikey/bootstrap' || path === '/api/two-factor/yubi-key/bootstrap') && method === 'POST') {
+    return handleBootstrapTwoFactorYubiKeyConfig(request, env, userId);
   }
 
   if (path === '/api/two-factor/disable' && (method === 'PUT' || method === 'POST')) {

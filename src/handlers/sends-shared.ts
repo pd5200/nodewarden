@@ -1,5 +1,10 @@
-import { Env, Send, SendAuthType, SendResponse, SendType, DEFAULT_DEV_SECRET } from '../types';
-import { notifyUserVaultSync } from '../durable/notifications-hub';
+import { Env, Send, SendAuthType, SendResponse, SendType } from '../types';
+import {
+  notifyUserSendCreate,
+  notifyUserSendDelete,
+  notifyUserSendUpdate,
+  notifyUserVaultSync,
+} from '../durable/notifications-hub';
 import { StorageService } from '../services/storage';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { readActingDeviceIdentifier } from '../utils/device';
@@ -16,6 +21,51 @@ export function notifyVaultSyncForRequest(
   revisionDate: string
 ): void {
   notifyUserVaultSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+}
+
+export function notifySendCreateForRequest(
+  request: Request,
+  env: Env,
+  sendId: string,
+  userId: string,
+  revisionDate: string
+): void {
+  notifyUserSendCreate(env, {
+    userId,
+    sendId,
+    revisionDate,
+    contextId: readActingDeviceIdentifier(request),
+  });
+}
+
+export function notifySendUpdateForRequest(
+  request: Request,
+  env: Env,
+  sendId: string,
+  userId: string,
+  revisionDate: string
+): void {
+  notifyUserSendUpdate(env, {
+    userId,
+    sendId,
+    revisionDate,
+    contextId: readActingDeviceIdentifier(request),
+  });
+}
+
+export function notifySendDeleteForRequest(
+  request: Request,
+  env: Env,
+  sendId: string,
+  userId: string,
+  revisionDate: string
+): void {
+  notifyUserSendDelete(env, {
+    userId,
+    sendId,
+    revisionDate,
+    contextId: readActingDeviceIdentifier(request),
+  });
 }
 
 export function getAliasedProp(source: unknown, aliases: string[]): { present: boolean; value: unknown } {
@@ -321,7 +371,7 @@ export function hasEmailAuth(send: Send): boolean {
 
 export function getSafeJwtSecret(env: Env): { ok: true; secret: string } | { ok: false; response: Response } {
   const secret = (env.JWT_SECRET || '').trim();
-  if (!secret || secret.length < LIMITS.auth.jwtSecretMinLength || secret === DEFAULT_DEV_SECRET) {
+  if (!secret || secret.length < LIMITS.auth.jwtSecretMinLength) {
     return { ok: false, response: errorResponse('Server configuration error', 500) };
   }
   return { ok: true, secret };

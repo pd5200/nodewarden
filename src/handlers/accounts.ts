@@ -1,4 +1,4 @@
-import { Env, User, ProfileResponse, DEFAULT_DEV_SECRET } from '../types';
+import { Env, User } from '../types';
 import { StorageService } from '../services/storage';
 import { AuthService } from '../services/auth';
 import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
@@ -6,13 +6,20 @@ import { auditRequestMetadata, writeAuditEvent, safeWriteAuditEvent } from '../s
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { LIMITS } from '../config/limits';
-import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
+import { hashApiKey } from '../utils/api-key';
+import { findMatchingTotpCounter, isTotpEnabled } from '../utils/totp';
 import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
 import { buildAccountKeys } from '../utils/user-decryption';
+import { buildProfileResponse } from '../utils/profile-response';
+import { isYubiKeyEnabled, isYubiKeyPublicId, requestYubicoApiCredentials, verifyYubicoOtp, yubicoCredentialsFromEnv, yubiKeyPublicIdFromOtp, type YubicoApiCredentials } from '../utils/yubico-otp';
 
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
+const TWO_FACTOR_PROVIDER_YUBIKEY = 3;
+const TWO_FACTOR_PROVIDER_WEBAUTHN = 7;
 const TOTP_USER_VERIFICATION_TOKEN_TTL_MS = 10 * 60 * 1000;
 const TOTP_BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const YUBICO_CLIENT_ID_CONFIG_KEY = 'globalSettings__yubico__clientId';
+const YUBICO_KEY_CONFIG_KEY = 'globalSettings__yubico__key';
 
 // CONTRACT:
 // users.master_password_hash is server-side login verification only. It does
@@ -148,10 +155,9 @@ function normalizeMasterPasswordHint(input: string | null | undefined): string |
   return normalized ? normalized : null;
 }
 
-function jwtSecretUnsafeReason(env: Env): 'missing' | 'default' | 'too_short' | null {
+function jwtSecretUnsafeReason(env: Env): 'missing' | 'too_short' | null {
   const secret = (env.JWT_SECRET || '').trim();
   if (!secret) return 'missing';
-  if (secret === DEFAULT_DEV_SECRET) return 'default';
   if (secret.length < LIMITS.auth.jwtSecretMinLength) return 'too_short';
   return null;
 }
@@ -174,6 +180,49 @@ function readBodyString(body: Record<string, unknown>, names: string[]): string 
   return '';
 }
 
+function readNestedString(source: unknown, path: string[]): string {
+  let current = source;
+  for (const key of path) {
+    if (!current || typeof current !== 'object') return '';
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === 'string' ? current : '';
+}
+
+function readNestedNumber(source: unknown, path: string[]): number | undefined {
+  let current = source;
+  for (const key of path) {
+    if (!current || typeof current !== 'object') return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === 'number' ? current : undefined;
+}
+
+async function getStoredYubicoCredentials(storage: StorageService, env: Env): Promise<YubicoApiCredentials | null> {
+  const fromEnv = yubicoCredentialsFromEnv(env);
+  if (fromEnv) return fromEnv;
+  const clientId = String(await storage.getConfigValue(YUBICO_CLIENT_ID_CONFIG_KEY) || '').trim();
+  if (!clientId) return null;
+  const secretKey = String(await storage.getConfigValue(YUBICO_KEY_CONFIG_KEY) || '').trim();
+  return { clientId, secretKey };
+}
+
+async function ensureStoredYubicoCredentials(
+  storage: StorageService,
+  env: Env,
+  email: string,
+  otp: string
+): Promise<YubicoApiCredentials | null> {
+  const existing = await getStoredYubicoCredentials(storage, env);
+  if (existing) return existing;
+
+  const credentials = await requestYubicoApiCredentials(email, otp);
+  if (!credentials) return null;
+  await storage.setConfigValue(YUBICO_CLIENT_ID_CONFIG_KEY, credentials.clientId);
+  await storage.setConfigValue(YUBICO_KEY_CONFIG_KEY, credentials.secretKey);
+  return credentials;
+}
+
 async function readRequestBody(request: Request): Promise<Record<string, unknown>> {
   const contentType = request.headers.get('content-type') || '';
   if (contentType.includes('application/x-www-form-urlencoded')) {
@@ -183,34 +232,32 @@ async function readRequestBody(request: Request): Promise<Record<string, unknown
   return await request.json();
 }
 
-function toProfile(user: User, env: Env): ProfileResponse {
-  void env;
+function masterPasswordPolicyResponse(): Record<string, unknown> {
+  return {
+    minComplexity: 0,
+    minLength: 0,
+    requireUpper: false,
+    requireLower: false,
+    requireNumbers: false,
+    requireSpecial: false,
+    enforceOnLogin: false,
+    object: 'masterPasswordPolicy',
+  };
+}
+
+function keysResponse(user: User): Record<string, unknown> {
   const accountKeys = buildAccountKeys(user);
   return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    emailVerified: true,
-    premium: true,
-    premiumFromOrganization: false,
-    usesKeyConnector: false,
-    masterPasswordHint: user.masterPasswordHint,
-    culture: 'en-US',
-    twoFactorEnabled: !!user.totpSecret,
+    Key: user.key,
+    PublicKey: user.publicKey ?? '',
+    PrivateKey: user.privateKey ?? '',
+    AccountKeys: accountKeys,
+    Object: 'keys',
     key: user.key,
-    privateKey: user.privateKey,
+    publicKey: user.publicKey ?? '',
+    privateKey: user.privateKey ?? '',
     accountKeys,
-    securityStamp: user.securityStamp || user.id,
-    organizations: [],
-    providers: [],
-    providerOrganizations: [],
-    forcePasswordReset: false,
-    avatarColor: null,
-    creationDate: user.createdAt,
-    verifyDevices: user.verifyDevices,
-    role: user.role,
-    status: user.status,
-    object: 'profile',
+    object: 'keys',
   };
 }
 
@@ -224,9 +271,7 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
   if (unsafe) {
     const message = unsafe === 'missing'
       ? 'JWT_SECRET is not set'
-      : unsafe === 'default'
-        ? 'JWT_SECRET is using the default/sample value. Please change it.'
-        : 'JWT_SECRET must be at least 32 characters';
+      : 'JWT_SECRET must be at least 32 characters';
     return errorResponse(message, 400);
   }
 
@@ -307,6 +352,12 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
     verifyDevices: true,
     totpSecret: null,
     totpRecoveryCode: null,
+    yubikeyKey1: null,
+    yubikeyKey2: null,
+    yubikeyKey3: null,
+    yubikeyKey4: null,
+    yubikeyKey5: null,
+    yubikeyNfc: false,
     apiKey: null,
     createdAt: now,
     updatedAt: now,
@@ -336,20 +387,31 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
     return errorResponse('Invite code is required', 403);
   }
 
+  const inviteMarked = await storage.markInviteUsed(inviteCode, user.id);
+  if (!inviteMarked) {
+    return errorResponse('Invite code is invalid or expired', 403);
+  }
+
   try {
     await storage.createUser(user);
   } catch (error) {
+    await storage.revertInviteUsed(inviteCode, user.id);
     const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
     if (msg.includes('unique') || msg.includes('constraint')) {
       return errorResponse('Email already registered', 409);
     }
+    console.error('Registration failed after invite reservation:', error);
     throw error;
   }
 
-  const inviteMarked = await storage.markInviteUsed(inviteCode, user.id);
-  if (!inviteMarked) {
-    await storage.deleteUserById(user.id);
-    return errorResponse('Invite code is invalid or expired', 403);
+  try {
+    const assigned = await storage.assignInviteUsedBy(inviteCode, user.id);
+    if (!assigned) {
+      console.warn('Invite used_by was not assigned after registration', { inviteCode, userId: user.id });
+    }
+  } catch (error) {
+    // The invite is already consumed. Do not reactivate it after the user row exists.
+    console.error('Invite used_by assignment failed after registration:', error);
   }
 
   await writeAuditEvent(storage, {
@@ -445,7 +507,7 @@ export async function handleGetProfile(request: Request, env: Env, userId: strin
   const storage = new StorageService(env.DB);
   const user = await storage.getUserById(userId);
   if (!user) return errorResponse('User not found', 404);
-  return jsonResponse(toProfile(user, env));
+  return jsonResponse(buildProfileResponse(user, env));
 }
 
 // PUT /api/accounts/profile
@@ -484,7 +546,7 @@ export async function handleUpdateProfile(request: Request, env: Env, userId: st
     },
   });
 
-  return jsonResponse(toProfile(user, env));
+  return jsonResponse(buildProfileResponse(user, env));
 }
 
 // PUT/POST /api/accounts/verify-devices
@@ -498,6 +560,7 @@ export async function handleSetVerifyDevices(request: Request, env: Env, userId:
     secret?: string;
     masterPasswordHash?: string;
     verifyDevices?: boolean;
+    VerifyDevices?: boolean;
   };
   try {
     body = await request.json();
@@ -505,7 +568,8 @@ export async function handleSetVerifyDevices(request: Request, env: Env, userId:
     return errorResponse('Invalid JSON', 400);
   }
 
-  if (typeof body.verifyDevices !== 'boolean') {
+  const verifyDevices = typeof body.verifyDevices === 'boolean' ? body.verifyDevices : body.VerifyDevices;
+  if (typeof verifyDevices !== 'boolean') {
     return errorResponse('verifyDevices must be true or false', 400);
   }
 
@@ -514,7 +578,7 @@ export async function handleSetVerifyDevices(request: Request, env: Env, userId:
     return errorResponse('User verification failed.', 400);
   }
 
-  user.verifyDevices = body.verifyDevices;
+  user.verifyDevices = verifyDevices;
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await writeAuditEvent(storage, {
@@ -531,6 +595,19 @@ export async function handleSetVerifyDevices(request: Request, env: Env, userId:
   });
 
   return new Response(null, { status: 200 });
+}
+
+// GET /api/accounts/keys
+export async function handleGetKeys(request: Request, env: Env, userId: string): Promise<Response> {
+  void request;
+  const storage = new StorageService(env.DB);
+  const user = await storage.getUserById(userId);
+
+  if (!user) {
+    return errorResponse('User not found', 404);
+  }
+
+  return jsonResponse(keysResponse(user));
 }
 
 // POST /api/accounts/keys
@@ -593,7 +670,7 @@ export async function handleSetKeys(request: Request, env: Env, userId: string):
     },
   });
 
-  return handleGetProfile(request, env, userId);
+  return jsonResponse(keysResponse(user));
 }
 
 // POST/PUT /api/accounts/password
@@ -607,6 +684,7 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
     masterPasswordHash?: string;
     currentPasswordHash?: string;
     newMasterPasswordHash?: string;
+    masterPasswordHint?: string | null;
     key?: string;
     newKey?: string;
     encryptedPrivateKey?: string;
@@ -617,6 +695,8 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
     kdfIterations?: number;
     kdfMemory?: number;
     kdfParallelism?: number;
+    authenticationData?: Record<string, unknown>;
+    unlockData?: Record<string, unknown>;
   };
   try {
     body = await request.json();
@@ -629,10 +709,16 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
   const valid = await auth.verifyPassword(currentHash, user.masterPasswordHash, user.email);
   if (!valid) return errorResponse('Invalid password', 400);
 
-  if (!body.newMasterPasswordHash) {
+  const newMasterPasswordHash =
+    body.newMasterPasswordHash ||
+    readNestedString(body, ['authenticationData', 'masterPasswordAuthenticationHash']);
+  if (!newMasterPasswordHash) {
     return errorResponse('newMasterPasswordHash is required', 400);
   }
-  const nextKey = body.newKey || body.key;
+  const nextKey =
+    body.newKey ||
+    body.key ||
+    readNestedString(body, ['unlockData', 'masterKeyWrappedUserKey']);
   const nextPrivateKey = body.newEncryptedPrivateKey || body.encryptedPrivateKey;
   const nextPublicKey = body.newPublicKey || body.publicKey;
   if (nextKey && !looksLikeEncString(nextKey)) {
@@ -642,17 +728,24 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
     return errorResponse('new encryptedPrivateKey is not a valid encrypted string', 400);
   }
 
-  const kdfErr = validateKdfParams(body.kdf ?? user.kdfType, body.kdfIterations, body.kdfMemory, body.kdfParallelism);
+  const nextKdf = body.kdf ?? readNestedNumber(body, ['unlockData', 'kdf', 'kdfType']) ?? user.kdfType;
+  const nextKdfIterations = body.kdfIterations ?? readNestedNumber(body, ['unlockData', 'kdf', 'iterations']);
+  const nextKdfMemory = body.kdfMemory ?? readNestedNumber(body, ['unlockData', 'kdf', 'memory']);
+  const nextKdfParallelism = body.kdfParallelism ?? readNestedNumber(body, ['unlockData', 'kdf', 'parallelism']);
+  const kdfErr = validateKdfParams(nextKdf, nextKdfIterations, nextKdfMemory, nextKdfParallelism);
   if (kdfErr) return errorResponse(kdfErr, 400);
 
-  user.masterPasswordHash = await auth.hashPasswordServer(body.newMasterPasswordHash, user.email);
+  user.masterPasswordHash = await auth.hashPasswordServer(newMasterPasswordHash, user.email);
   if (nextKey) user.key = nextKey;
   if (nextPrivateKey) user.privateKey = nextPrivateKey;
   if (nextPublicKey) user.publicKey = nextPublicKey;
-  if (typeof body.kdf === 'number') user.kdfType = body.kdf;
-  if (typeof body.kdfIterations === 'number') user.kdfIterations = body.kdfIterations;
-  if (typeof body.kdfMemory === 'number') user.kdfMemory = body.kdfMemory;
-  if (typeof body.kdfParallelism === 'number') user.kdfParallelism = body.kdfParallelism;
+  if (typeof nextKdf === 'number') user.kdfType = nextKdf;
+  if (typeof nextKdfIterations === 'number') user.kdfIterations = nextKdfIterations;
+  if (typeof nextKdfMemory === 'number') user.kdfMemory = nextKdfMemory;
+  if (typeof nextKdfParallelism === 'number') user.kdfParallelism = nextKdfParallelism;
+  if (typeof body.masterPasswordHint === 'string' || body.masterPasswordHint === null) {
+    user.masterPasswordHint = body.masterPasswordHint;
+  }
   user.securityStamp = generateUUID();
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
@@ -705,6 +798,29 @@ function twoFactorAuthenticatorResponse(
   };
 }
 
+function yubiKeyResponse(user: User): Record<string, unknown> {
+  return {
+    Enabled: isYubiKeyEnabled(user),
+    Key1: user.yubikeyKey1,
+    Key2: user.yubikeyKey2,
+    Key3: user.yubikeyKey3,
+    Key4: user.yubikeyKey4,
+    Key5: user.yubikeyKey5,
+    Nfc: !!user.yubikeyNfc,
+    Object: 'twoFactorYubiKey',
+  };
+}
+
+async function yubiKeySettingsResponse(storage: StorageService, env: Env, user: User): Promise<Record<string, unknown>> {
+  const credentials = await getStoredYubicoCredentials(storage, env);
+  return {
+    ...yubiKeyResponse(user),
+    YubicoConfigured: !!credentials?.clientId,
+    YubicoClientId: credentials?.clientId ?? '',
+    YubicoSecretKey: credentials?.secretKey ?? '',
+  };
+}
+
 // GET /api/two-factor
 export async function handleGetTwoFactorProviders(request: Request, env: Env, userId: string): Promise<Response> {
   void request;
@@ -712,9 +828,11 @@ export async function handleGetTwoFactorProviders(request: Request, env: Env, us
   const user = await storage.getUserById(userId);
   if (!user) return errorResponse('User not found', 404);
 
-  const data = user.totpSecret
-    ? [twoFactorProviderResponse(TWO_FACTOR_PROVIDER_AUTHENTICATOR, true)]
-    : [];
+  const data = [];
+  if (isTotpEnabled(user.totpSecret)) data.push(twoFactorProviderResponse(TWO_FACTOR_PROVIDER_AUTHENTICATOR, true));
+  if (isYubiKeyEnabled(user)) data.push(twoFactorProviderResponse(TWO_FACTOR_PROVIDER_YUBIKEY, true));
+  const webAuthnCredentials = await storage.getAccountPasskeyCredentialsByUserId(user.id, 'twoFactor');
+  if (webAuthnCredentials.length > 0) data.push(twoFactorProviderResponse(TWO_FACTOR_PROVIDER_WEBAUTHN, true));
 
   return jsonResponse({
     Data: data,
@@ -746,6 +864,27 @@ export async function handleGetTwoFactorAuthenticator(request: Request, env: Env
   return jsonResponse(twoFactorAuthenticatorResponse(!!user.totpSecret, key, userVerificationToken));
 }
 
+// POST /api/two-factor/get-yubikey
+export async function handleGetTwoFactorYubiKey(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const auth = new AuthService(env);
+  const user = await storage.getUserById(userId);
+  if (!user) return errorResponse('User not found', 404);
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readRequestBody(request);
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  const secret = readBodyString(body, ['masterPasswordHash', 'MasterPasswordHash', 'otp', 'OTP', 'secret', 'Secret']);
+  const verified = await verifyUserSecret(auth, user, secret);
+  if (!verified) return errorResponse('User verification failed.', 400);
+
+  return jsonResponse(await yubiKeySettingsResponse(storage, env, user));
+}
+
 // PUT/POST /api/two-factor/authenticator
 export async function handlePutTwoFactorAuthenticator(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
@@ -769,7 +908,10 @@ export async function handlePutTwoFactorAuthenticator(request: Request, env: Env
     return errorResponse('User verification failed.', 400);
   }
   if (!isTotpEnabled(key)) return errorResponse('Invalid TOTP secret', 400);
-  if (!await verifyTotpToken(key, token)) return errorResponse('Invalid token.', 400);
+  const matchedCounter = await findMatchingTotpCounter(key, token);
+  if (matchedCounter == null || !await storage.consumeTotpLoginCounter(user.id, matchedCounter)) {
+    return errorResponse('Invalid token.', 400);
+  }
 
   user.totpSecret = key;
   if (!user.totpRecoveryCode) {
@@ -792,6 +934,141 @@ export async function handlePutTwoFactorAuthenticator(request: Request, env: Env
   return jsonResponse(twoFactorAuthenticatorResponse(true, key));
 }
 
+// PUT/POST /api/two-factor/yubikey
+export async function handlePutTwoFactorYubiKey(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const auth = new AuthService(env);
+  const user = await storage.getUserById(userId);
+  if (!user) return errorResponse('User not found', 404);
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readRequestBody(request);
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  const secret = readBodyString(body, ['masterPasswordHash', 'MasterPasswordHash', 'otp', 'OTP', 'secret', 'Secret']);
+  const verified = await verifyUserSecret(auth, user, secret);
+  if (!verified) return errorResponse('User verification failed.', 400);
+
+  const keys = [
+    readBodyString(body, ['key1', 'Key1']),
+    readBodyString(body, ['key2', 'Key2']),
+    readBodyString(body, ['key3', 'Key3']),
+    readBodyString(body, ['key4', 'Key4']),
+    readBodyString(body, ['key5', 'Key5']),
+  ];
+  const publicIds: Array<string | null> = [];
+  let credentials = await getStoredYubicoCredentials(storage, env);
+  let apiKeyBootstrapOtpIndex: number | null = null;
+  for (const key of keys) {
+    const trimmed = key.trim();
+    if (!trimmed) {
+      publicIds.push(null);
+      continue;
+    }
+    const publicId = yubiKeyPublicIdFromOtp(trimmed);
+    if (!publicId) return errorResponse('Invalid YubiKey OTP.', 400);
+    if (isYubiKeyPublicId(trimmed)) {
+      publicIds.push(publicId);
+      continue;
+    }
+    if (!credentials) {
+      credentials = await ensureStoredYubicoCredentials(storage, env, user.email, trimmed);
+      if (!credentials) return errorResponse('Unable to initialize Yubico validation credentials.', 400);
+      apiKeyBootstrapOtpIndex = publicIds.length;
+    }
+    if (apiKeyBootstrapOtpIndex !== publicIds.length && !await verifyYubicoOtp(env, trimmed, credentials)) {
+      return errorResponse('Invalid YubiKey OTP.', 400);
+    }
+    publicIds.push(publicId);
+  }
+  if (!publicIds.some(Boolean)) return errorResponse('At least one YubiKey OTP is required.', 400);
+
+  user.yubikeyKey1 = publicIds[0] ?? null;
+  user.yubikeyKey2 = publicIds[1] ?? null;
+  user.yubikeyKey3 = publicIds[2] ?? null;
+  user.yubikeyKey4 = publicIds[3] ?? null;
+  user.yubikeyKey5 = publicIds[4] ?? null;
+  user.yubikeyNfc = !!(body.nfc ?? body.Nfc);
+  if (!user.totpRecoveryCode) {
+    user.totpRecoveryCode = createRecoveryCode();
+  }
+  user.updatedAt = new Date().toISOString();
+  await storage.saveUser(user);
+  await storage.deleteRefreshTokensByUserId(user.id);
+  AuthService.invalidateUserCache(user.id);
+  await writeAuditEvent(storage, {
+    actorUserId: user.id,
+    action: 'account.yubikey.enable',
+    category: 'security',
+    level: 'security',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: auditRequestMetadata(request),
+  });
+
+  return jsonResponse(await yubiKeySettingsResponse(storage, env, user));
+}
+
+// PUT/POST /api/two-factor/yubikey/config
+export async function handlePutTwoFactorYubiKeyConfig(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const auth = new AuthService(env);
+  const user = await storage.getUserById(userId);
+  if (!user) return errorResponse('User not found', 404);
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readRequestBody(request);
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  const secret = readBodyString(body, ['masterPasswordHash', 'MasterPasswordHash', 'otp', 'OTP', 'secret', 'Secret']);
+  const verified = await verifyUserSecret(auth, user, secret);
+  if (!verified) return errorResponse('User verification failed.', 400);
+
+  const clientId = readBodyString(body, ['yubicoClientId', 'YubicoClientId', 'clientId', 'ClientId']).trim();
+  const secretKey = readBodyString(body, ['yubicoSecretKey', 'YubicoSecretKey', 'secretKey', 'SecretKey']).trim();
+  if (!clientId) return errorResponse('Yubico Client ID is required.', 400);
+
+  await storage.setConfigValue(YUBICO_CLIENT_ID_CONFIG_KEY, clientId);
+  await storage.setConfigValue(YUBICO_KEY_CONFIG_KEY, secretKey);
+
+  return jsonResponse(await yubiKeySettingsResponse(storage, env, user));
+}
+
+// POST /api/two-factor/yubikey/bootstrap
+export async function handleBootstrapTwoFactorYubiKeyConfig(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const auth = new AuthService(env);
+  const user = await storage.getUserById(userId);
+  if (!user) return errorResponse('User not found', 404);
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readRequestBody(request);
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  const secret = readBodyString(body, ['masterPasswordHash', 'MasterPasswordHash', 'secret', 'Secret']);
+  const verified = await verifyUserSecret(auth, user, secret);
+  if (!verified) return errorResponse('User verification failed.', 400);
+
+  const otp = readBodyString(body, ['otp', 'OTP', 'token', 'Token']).trim();
+  if (!yubiKeyPublicIdFromOtp(otp)) return errorResponse('Invalid YubiKey OTP.', 400);
+  const credentials = await requestYubicoApiCredentials(user.email, otp);
+  if (!credentials) return errorResponse('Unable to initialize Yubico validation credentials.', 400);
+
+  await storage.setConfigValue(YUBICO_CLIENT_ID_CONFIG_KEY, credentials.clientId);
+  await storage.setConfigValue(YUBICO_KEY_CONFIG_KEY, credentials.secretKey);
+
+  return jsonResponse(await yubiKeySettingsResponse(storage, env, user));
+}
+
 // DELETE /api/two-factor/authenticator and PUT/POST /api/two-factor/disable
 export async function handleDisableTwoFactorProvider(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
@@ -808,7 +1085,7 @@ export async function handleDisableTwoFactorProvider(request: Request, env: Env,
 
   const typeRaw = body.type ?? body.Type ?? TWO_FACTOR_PROVIDER_AUTHENTICATOR;
   const type = typeof typeRaw === 'number' ? typeRaw : Number.parseInt(String(typeRaw), 10);
-  if (type !== TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
+  if (![TWO_FACTOR_PROVIDER_AUTHENTICATOR, TWO_FACTOR_PROVIDER_YUBIKEY, TWO_FACTOR_PROVIDER_WEBAUTHN].includes(type)) {
     return errorResponse('Two-factor provider is not supported by this server.', 400);
   }
 
@@ -824,14 +1101,32 @@ export async function handleDisableTwoFactorProvider(request: Request, env: Env,
   }
   if (!verified) return errorResponse('User verification failed.', 400);
 
-  user.totpSecret = null;
+  if (type === TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
+    user.totpSecret = null;
+  } else if (type === TWO_FACTOR_PROVIDER_YUBIKEY) {
+    user.yubikeyKey1 = null;
+    user.yubikeyKey2 = null;
+    user.yubikeyKey3 = null;
+    user.yubikeyKey4 = null;
+    user.yubikeyKey5 = null;
+    user.yubikeyNfc = false;
+  } else {
+    const credentials = await storage.getAccountPasskeyCredentialsByUserId(user.id, 'twoFactor');
+    for (const credential of credentials) {
+      await storage.deleteAccountPasskeyCredential(user.id, credential.id, 'twoFactor');
+    }
+  }
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await storage.deleteRefreshTokensByUserId(user.id);
   AuthService.invalidateUserCache(user.id);
   await writeAuditEvent(storage, {
     actorUserId: user.id,
-    action: 'account.totp.disable',
+    action: type === TWO_FACTOR_PROVIDER_AUTHENTICATOR
+      ? 'account.totp.disable'
+      : type === TWO_FACTOR_PROVIDER_YUBIKEY
+        ? 'account.yubikey.disable'
+        : 'account.webauthn_2fa.disable',
     category: 'security',
     level: 'security',
     targetType: 'user',
@@ -839,11 +1134,11 @@ export async function handleDisableTwoFactorProvider(request: Request, env: Env,
     metadata: auditRequestMetadata(request),
   });
 
-  return jsonResponse(twoFactorProviderResponse(TWO_FACTOR_PROVIDER_AUTHENTICATOR, false));
+  return jsonResponse(twoFactorProviderResponse(type, false));
 }
 
 // PUT /api/accounts/totp
-// enable: { enabled: true, secret: "...", token: "123456" }
+// enable: { enabled: true, secret: "...", token: "123456", masterPasswordHash?: "...", userVerificationToken?: "..." }
 // disable: { enabled: false, masterPasswordHash: "..." }
 export async function handleSetTotpStatus(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
@@ -851,7 +1146,13 @@ export async function handleSetTotpStatus(request: Request, env: Env, userId: st
   const user = await storage.getUserById(userId);
   if (!user) return errorResponse('User not found', 404);
 
-  let body: { enabled?: boolean; secret?: string; token?: string; masterPasswordHash?: string };
+  let body: {
+    enabled?: boolean;
+    secret?: string;
+    token?: string;
+    masterPasswordHash?: string;
+    userVerificationToken?: string;
+  };
   try {
     body = await request.json();
   } catch {
@@ -860,14 +1161,26 @@ export async function handleSetTotpStatus(request: Request, env: Env, userId: st
 
   if (body.enabled === true) {
     const normalizedSecret = normalizeTotpSecret(body.secret || '');
+    const masterPasswordHash = readBodyString(body, ['masterPasswordHash', 'MasterPasswordHash']);
+    const userVerificationToken = readBodyString(body, ['userVerificationToken', 'UserVerificationToken']);
     if (!isTotpEnabled(normalizedSecret)) {
       return errorResponse('Invalid TOTP secret', 400);
     }
     if (!body.token) {
       return errorResponse('TOTP token is required', 400);
     }
-    const verified = await verifyTotpToken(normalizedSecret, body.token);
-    if (!verified) {
+    let verifiedUser = false;
+    if (userVerificationToken) {
+      verifiedUser = await verifyTotpUserVerificationToken(env, user, normalizedSecret, userVerificationToken);
+    }
+    if (!verifiedUser && masterPasswordHash) {
+      verifiedUser = await auth.verifyPassword(masterPasswordHash, user.masterPasswordHash, user.email);
+    }
+    if (!verifiedUser) {
+      return errorResponse('User verification failed.', 400);
+    }
+    const matchedCounter = await findMatchingTotpCounter(normalizedSecret, body.token);
+    if (matchedCounter == null || !await storage.consumeTotpLoginCounter(user.id, matchedCounter)) {
       return errorResponse('Invalid TOTP token', 400);
     }
     user.totpSecret = normalizedSecret;
@@ -1015,6 +1328,16 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
   }
 
   user.totpSecret = null;
+  user.yubikeyKey1 = null;
+  user.yubikeyKey2 = null;
+  user.yubikeyKey3 = null;
+  user.yubikeyKey4 = null;
+  user.yubikeyKey5 = null;
+  user.yubikeyNfc = false;
+  const webAuthnCredentials = await storage.getAccountPasskeyCredentialsByUserId(user.id, 'twoFactor');
+  for (const credential of webAuthnCredentials) {
+    await storage.deleteAccountPasskeyCredential(user.id, credential.id, 'twoFactor');
+  }
   user.totpRecoveryCode = createRecoveryCode();
   user.securityStamp = generateUUID();
   user.updatedAt = new Date().toISOString();
@@ -1061,23 +1384,26 @@ export async function handleVerifyPassword(request: Request, env: Env, userId: s
     return errorResponse('User not found', 404);
   }
 
-  let body: { masterPasswordHash?: string };
+  let body: { masterPasswordHash?: string; authenticationData?: Record<string, unknown> };
   try {
     body = await request.json();
   } catch {
     return errorResponse('Invalid JSON', 400);
   }
 
-  if (!body.masterPasswordHash) {
+  const masterPasswordHash =
+    body.masterPasswordHash ||
+    readNestedString(body, ['authenticationData', 'masterPasswordAuthenticationHash']);
+  if (!masterPasswordHash) {
     return errorResponse('masterPasswordHash is required', 400);
   }
 
-  const valid = await auth.verifyPassword(body.masterPasswordHash, user.masterPasswordHash, user.email);
+  const valid = await auth.verifyPassword(masterPasswordHash, user.masterPasswordHash, user.email);
   if (!valid) {
     return errorResponse('Invalid password', 400);
   }
 
-  return new Response(null, { status: 200 });
+  return jsonResponse(masterPasswordPolicyResponse());
 }
 
 // POST /api/accounts/api-key
@@ -1114,29 +1440,28 @@ async function apiKey(request: Request, env: Env, userId: string, rotate: boolea
   const valid = await auth.verifyPassword(currentHash, user.masterPasswordHash, user.email);
   if (!valid) return errorResponse('Invalid password', 400);
 
-  if (rotate || user.apiKey === null) {
-    // Upstream apikeys are 30-character random alphanumeric strings
-    user.apiKey = randomStringAlphanum(LIMITS.auth.clientSecretLength);
-    if (rotate) {
-      user.securityStamp = generateUUID();
-      await storage.deleteRefreshTokensByUserId(user.id);
-    }
-    user.updatedAt = new Date().toISOString();
-    await storage.saveUser(user);
-    AuthService.invalidateUserCache(user.id);
-    await writeAuditEvent(storage, {
-      actorUserId: user.id,
-      action: rotate ? 'account.api_key.rotate' : 'account.api_key.create',
-      category: 'security',
-      level: rotate ? 'security' : 'info',
-      targetType: 'user',
-      targetId: user.id,
-      metadata: auditRequestMetadata(request),
-    });
+  // Only the fresh secret is returned once; the database stores a hash.
+  const plainApiKey = randomStringAlphanum(LIMITS.auth.clientSecretLength);
+  user.apiKey = await hashApiKey(plainApiKey);
+  if (rotate) {
+    user.securityStamp = generateUUID();
+    await storage.deleteRefreshTokensByUserId(user.id);
   }
+  user.updatedAt = new Date().toISOString();
+  await storage.saveUser(user);
+  AuthService.invalidateUserCache(user.id);
+  await writeAuditEvent(storage, {
+    actorUserId: user.id,
+    action: rotate ? 'account.api_key.rotate' : 'account.api_key.create',
+    category: 'security',
+    level: rotate ? 'security' : 'info',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: auditRequestMetadata(request),
+  });
 
   return jsonResponse({
-    apiKey: user.apiKey,
+    apiKey: plainApiKey,
     revisionDate: user.updatedAt,
     object: 'apiKey',
   });

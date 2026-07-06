@@ -14,14 +14,16 @@ export interface Env {
   WEBAUTHN_RP_ID?: string;
   WEBAUTHN_RP_NAME?: string;
   WEBAUTHN_ALLOWED_ORIGINS?: string;
+  YUBICO_CLIENT_ID?: string;
+  YUBICO_SECRET_KEY?: string;
+  YUBICO_VALIDATION_URLS?: string;
+  'globalSettings__yubico__clientId'?: string;
+  'globalSettings__yubico__key'?: string;
+  'globalSettings__yubico__validationUrls'?: string;
 }
 
 export type UserRole = 'admin' | 'user';
 export type UserStatus = 'active' | 'banned';
-
-// Sample JWT secret used by `.dev.vars.example`.
-// If runtime JWT_SECRET equals this value, treat it as unsafe.
-export const DEFAULT_DEV_SECRET = 'Enter-your-JWT-key-here-at-least-32-characters';
 
 // Attachment model
 export interface Attachment {
@@ -53,6 +55,12 @@ export interface User {
   verifyDevices?: boolean;
   totpSecret: string | null;
   totpRecoveryCode: string | null;
+  yubikeyKey1: string | null;
+  yubikeyKey2: string | null;
+  yubikeyKey3: string | null;
+  yubikeyKey4: string | null;
+  yubikeyKey5: string | null;
+  yubikeyNfc: boolean;
   apiKey: string | null;
   createdAt: string;
   updatedAt: string;
@@ -231,6 +239,8 @@ export interface Device {
   encryptedUserKey: string | null;
   encryptedPublicKey: string | null;
   encryptedPrivateKey: string | null;
+  pushUuid: string | null;
+  pushToken: string | null;
   devicePendingAuthRequest?: DevicePendingAuthRequest | null;
   lastSeenAt: string | null;
   createdAt: string;
@@ -242,6 +252,7 @@ export type AccountPasskeyPrfStatus = 0 | 1 | 2;
 export interface AccountPasskeyCredential {
   id: string;
   userId: string;
+  purpose: 'login' | 'twoFactor';
   name: string;
   publicKey: string;
   credentialId: string;
@@ -257,7 +268,12 @@ export interface AccountPasskeyCredential {
   updatedAt: string;
 }
 
-export type AccountPasskeyChallengeScope = 'Authentication' | 'CreateCredential' | 'UpdateKeySet';
+export type AccountPasskeyChallengeScope =
+  | 'Authentication'
+  | 'CreateCredential'
+  | 'UpdateKeySet'
+  | 'TwoFactorAuthentication'
+  | 'TwoFactorCreate';
 
 export interface AccountPasskeyChallenge {
   challengeHash: string;
@@ -305,6 +321,7 @@ export interface DeviceResponse {
   type: number;
   creationDate: string;
   revisionDate: string;
+  lastActivityDate?: string | null;
   lastSeenAt?: string | null;
   hasStoredDevice?: boolean;
   isTrusted: boolean;
@@ -464,8 +481,18 @@ export interface TokenResponse {
   ResetMasterPassword: boolean;
   scope: string;
   unofficialServer: boolean;
+  UserVerificationToken?: string;
+  userVerificationToken?: string;
   MasterPasswordPolicy?: {
+    minComplexity: number;
+    minLength: number;
+    requireUpper: boolean;
+    requireLower: boolean;
+    requireNumbers: boolean;
+    requireSpecial: boolean;
+    enforceOnLogin: boolean;
     Object: string;
+    object?: string;
   } | null;
   ApiUseKeyConnector?: boolean;
   AccountKeys?: any | null;
@@ -489,17 +516,19 @@ export interface ProfileResponse {
   masterPasswordHint: string | null;
   culture: string;
   twoFactorEnabled: boolean;
+  yubikeyEnabled?: boolean;
   key: string;
   privateKey: string | null;
   accountKeys: any | null;
   securityStamp: string;
   organizations: any[];
+  organizationsNew?: any[];
   providers: any[];
   providerOrganizations: any[];
   forcePasswordReset: boolean;
   avatarColor: string | null;
   creationDate: string;
-  verifyDevices?: boolean;
+  verifyDevices: boolean;
   role?: UserRole;
   status?: UserStatus;
   object: string;
@@ -558,6 +587,7 @@ export interface SyncResponse {
   ciphers: CipherResponse[];
   domains: any;
   policies: any[];
+  policiesNew?: any[];
   sends: SendResponse[];
   UserDecryption?: {
     MasterPasswordUnlock: MasterPasswordUnlock | null;
@@ -565,6 +595,10 @@ export interface SyncResponse {
     KeyConnectorOption?: null;
     WebAuthnPrfOption?: WebAuthnPrfDecryptionOption | null;
     WebAuthnPrfOptions?: WebAuthnPrfDecryptionOption[];
+    V2UpgradeToken?: {
+      WrappedUserKey1: string;
+      WrappedUserKey2: string;
+    } | null;
     Object?: string;
   } | null;
   // PascalCase for desktop/browser clients

@@ -14,6 +14,19 @@ function normalizeText(value: unknown, maxLength: number): string {
   return String(value ?? '').trim().slice(0, maxLength);
 }
 
+function isSerializedEncString(value: unknown): value is string {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  const parts = text.split('.');
+  if (parts.length !== 2) return false;
+  const type = Number(parts[0]);
+  const bodyParts = parts[1].split('|');
+  if (type === 2) return bodyParts.length === 3 && bodyParts.every(Boolean);
+  if (type === 3 || type === 4) return bodyParts.length === 1 && !!bodyParts[0];
+  if (type === 5 || type === 6) return bodyParts.length === 2 && bodyParts.every(Boolean);
+  return false;
+}
+
 function getClientIp(request: Request): string | null {
   return (
     request.headers.get('CF-Connecting-IP') ||
@@ -188,7 +201,7 @@ export async function handleCreateAuthRequest(request: Request, env: Env): Promi
 
 export async function handleGetAuthRequest(request: Request, env: Env, userId: string, id: string): Promise<Response> {
   const storage = new StorageService(env.DB);
-  const authRequest = await storage.getAuthRequestById(id);
+  const authRequest = await storage.getAuthRequestByIdForUser(id, userId);
   if (!authRequest || authRequest.userId !== userId) return errorResponse('Not found', 404);
   return jsonResponse(toAuthRequestResponse(request, authRequest));
 }
@@ -226,7 +239,7 @@ export async function handleUpdateAuthRequest(request: Request, env: Env, userId
   const body = await readJsonBody(request);
   if (!body) return errorResponse('Invalid request payload', 400);
 
-  const authRequest = await storage.getAuthRequestById(id);
+  const authRequest = await storage.getAuthRequestByIdForUser(id, userId);
   if (!authRequest || authRequest.userId !== userId || isAuthRequestExpired(authRequest)) {
     return errorResponse('Not found', 404);
   }
@@ -251,6 +264,9 @@ export async function handleUpdateAuthRequest(request: Request, env: Env, userId
   if (approved && !key) {
     return errorResponse('Encrypted key is required to approve the request.', 400);
   }
+  if (approved && !isSerializedEncString(key)) {
+    return errorResponse('Encrypted key is not a valid encrypted string.', 400);
+  }
 
   const updated = await storage.updateAuthRequestResponse(id, userId, {
     approved,
@@ -259,7 +275,7 @@ export async function handleUpdateAuthRequest(request: Request, env: Env, userId
     masterPasswordHash,
   });
   if (!updated) return errorResponse('Auth request has already been answered.', 409);
-  const updatedRequest = await storage.getAuthRequestById(id);
+  const updatedRequest = await storage.getAuthRequestByIdForUser(id, userId);
   // Match Bitwarden upstream behavior: only approval wakes the originating anonymous
   // client. Denials are not pushed to avoid leaking that a login attempt was rejected.
   if (approved) {
